@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+Free LLM API Router - Route requests across multiple free LLM providers.
+OpenAI-compatible /v1/chat/completions endpoint with automatic failover.
+"""
+
+import asyncio
+import time
+import json
+import os
+import yaml
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from pathlib import Path
+from typing import Optional
+from dataclasses import dataclass
+
+app = FastAPI(title="Free LLM API Router", version="1.0.0")
+
+
+@dataclass
+class ProviderState:
+    name: str
+    base_url: str
+    api_key: str
+    models: list
+    priority: int = 1
+    requests_made: int = 0
+    last_used: float = 0
+    rate_limited_until: float = 0
+    errors: int = 0
+    avg_latency: float = 0
+
+
+class Router:
+    def __init__(self, config_path="config.yaml"):
+        self.providers: list[ProviderState] = []
+        self.strategy = "round-robin"
+        self.failover = True
+        self.max_retries = 3
+        self.timeout = 30
+        self.current_idx = 0
+        self.load_config(config_path)
+
+    def load_config(self, path):
+        config_file = Path(path)
+        if not config_file.exists():
+            config_file = Path("config.example.yaml")
+        if config_file.exists():
+            with open(config_file) as f:
+                cfg = yaml.safe_load(f) or {}
+        else:
+            cfg = {"providers": [], "routing": {}}
+
+        for p in cfg.get("providers", []):
+            key = p.get("api_key", "")
+            if key.startswith("YOUR_"):
+                continue  # Skip unconfigured providers
+            self.providers.append(ProviderState(
+                name=p["name"],
+                base_url=p["base_url"],
+                api_key=key,
+                models=p.get("models", []),
+                priority=p.get("priority", 99),
+            ))
+
+        routing = cfg.get("routing", {})
+        self.strategy = routing.get("strategy", "round-robin")
+        self.failover = routing.get("failover", True)
+        self.max_retries = routing.get("max_retries", 3)
+        self.timeout = routing.get("timeout", 30)
+
+    def get_provider(self, model: str = "auto") -> Optional[ProviderState]:
+        now = time.time()
+        available = [
+            p for p in self.providers
+            if p.rate_limited_until < now
+            and (
+                model == "auto"
+                or model in p.models
+                or any(model.startswith(m.split("/")[0]) for m in p.models)
+            )
+        ]
+        if not available:
+            available = [p for p in self.providers if p.rate_limited_until < now]
+        if not available:
+            return None
+
+        if self.strategy == "round-robin":
+            provider = available[self.current_idx % len(available)]
+            self.current_idx += 1
+        elif self.strategy == "priority":
+            provider = min(available, key=lambda p: p.priority)
+        elif self.strategy == "least-latency":
+            provider = min(available, key=lambda p: p.avg_latency if p.avg_latency > 0 else float("inf"))
+        else:
+            provider = available[self.current_idx % len(available)]
+            self.current_idx += 1
+
+        return provider
+
+    def mark_rate_limited(self, provider: ProviderState, retry_after: int = 60):
+        provider.rate_limited_until = time.time() + retry_after
+
+    def record_success(self, provider: ProviderState, latency: float):
+        provider.requests_made += 1
+        provider.last_used = time.time()
+        provider.errors = 0
+        provider.avg_latency = (
+            0.7 * provider.avg_latency + 0.3 * latency
+            if provider.avg_latency > 0
+            else latency
+        )
+
+    def record_error(self, provider: ProviderState):
+        provider.errors += 1
+
+
+router = Router()
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    body = await request.json()
+    model = body.get("model", "auto")
+    stream = body.get("stream", False)
+
+    for attempt in range(router.max_retries):
+        provider = router.get_provider(model)
+        if not provider:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": "All providers unavailable", "type": "server_error"}},
+            )
+
+        actual_model = model
+        if model == "auto":
+            actual_model = provider.models[0] if provider.models else "default"
+        elif "/" in model:
+            actual_model = model.split("/", 1)[1]
+
+        request_body = {**body, "model": actual_model}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {provider.api_key}",
+        }
+
+        start = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=router.timeout) as client:
+                if stream:
+                    req = client.build_request(
+                        "POST",
+                        f"{provider.base_url}/chat/completions",
+                        json=request_body,
+                        headers=headers,
+                    )
+                    resp = await client.send(req, stream=True)
+
+                    if resp.status_code == 429:
+                        router.mark_rate_limited(provider)
+                        if router.failover:
+                            continue
+                        return JSONResponse(status_code=429, content={"error": {"message": "Rate limited"}})
+
+                    if resp.status_code != 200:
+                        router.record_error(provider)
+                        if router.failover:
+                            continue
+                        return JSONResponse(
+                            status_code=resp.status_code,
+                            content={"error": {"message": f"Provider error: {resp.status_code}"}},
+                        )
+
+                    latency = time.time() - start
+                    router.record_success(provider, latency)
+
+                    async def stream_gen():
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+
+                    return StreamingResponse(stream_gen(), media_type="text/event-stream")
+                else:
+                    resp = await client.post(
+                        f"{provider.base_url}/chat/completions",
+                        json=request_body,
+                        headers=headers,
+                    )
+                    latency = time.time() - start
+
+                    if resp.status_code == 429:
+                        router.mark_rate_limited(provider)
+                        if router.failover:
+                            continue
+                        return JSONResponse(status_code=429, content={"error": {"message": "Rate limited"}})
+
+                    if resp.status_code != 200:
+                        router.record_error(provider)
+                        if router.failover:
+                            continue
+                        return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+                    router.record_success(provider, latency)
+                    result = resp.json()
+                    result["_router"] = {"provider": provider.name, "latency_ms": int(latency * 1000)}
+                    return JSONResponse(content=result)
+
+        except Exception as e:
+            router.record_error(provider)
+            if router.failover and attempt < router.max_retries - 1:
+                continue
+            return JSONResponse(status_code=502, content={"error": {"message": str(e)}})
+
+    return JSONResponse(status_code=503, content={"error": {"message": "All retries exhausted"}})
+
+
+@app.get("/v1/models")
+async def list_models():
+    models = []
+    for p in router.providers:
+        for m in p.models:
+            models.append({"id": f"{p.name}/{m}", "object": "model", "owned_by": p.name})
+    models.append({"id": "auto", "object": "model", "owned_by": "router"})
+    return {"object": "list", "data": models}
+
+
+@app.get("/status")
+async def status():
+    return {
+        "providers": [
+            {
+                "name": p.name,
+                "available": p.rate_limited_until < time.time(),
+                "requests": p.requests_made,
+                "avg_latency_ms": int(p.avg_latency * 1000),
+                "errors": p.errors,
+                "rate_limited_for": max(0, int(p.rate_limited_until - time.time())),
+            }
+            for p in router.providers
+        ],
+        "strategy": router.strategy,
+        "total_providers": len(router.providers),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "providers": len(router.providers)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8080))
+    print(f"🚀 Free LLM API Router starting on port {port}")
+    print(f"📊 {len(router.providers)} providers loaded")
+    print(f"🔄 Strategy: {router.strategy}")
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -1,0 +1,39 @@
+# Free LLM API Router Configuration
+# Copy to config.yaml and add your free API keys
+
+providers:
+  - name: mistral
+    base_url: https://api.mistral.ai/v1
+    api_key: YOUR_MISTRAL_KEY  # Free at console.mistral.ai
+    models: [mistral-small-latest, codestral-latest, open-mistral-nemo]
+    priority: 1
+
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key: YOUR_GROQ_KEY  # Free at console.groq.com
+    models: [llama-3.3-70b-versatile, mixtral-8x7b-32768, gemma2-9b-it]
+    priority: 2
+
+  - name: cerebras
+    base_url: https://api.cerebras.ai/v1
+    api_key: YOUR_CEREBRAS_KEY  # Free at cloud.cerebras.ai
+    models: [llama-3.3-70b, llama-4-scout-17b-16e-instruct]
+    priority: 3
+
+  - name: sambanova
+    base_url: https://api.sambanova.ai/v1
+    api_key: YOUR_SAMBANOVA_KEY  # Free at cloud.sambanova.ai
+    models: [Meta-Llama-3.3-70B-Instruct, DeepSeek-V3-0324]
+    priority: 4
+
+  - name: together
+    base_url: https://api.together.xyz/v1
+    api_key: YOUR_TOGETHER_KEY  # $1 free credits at api.together.xyz
+    models: [meta-llama/Llama-3.3-70B-Instruct-Turbo, Qwen/Qwen3-235B-A22B-fp8-turbo]
+    priority: 5
+
+routing:
+  strategy: round-robin  # round-robin | priority | random | least-latency
+  failover: true
+  max_retries: 3
+  timeout: 30
