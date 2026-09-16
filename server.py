@@ -8,15 +8,33 @@ import asyncio
 import time
 import json
 import os
+import gc
 import yaml
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 
-app = FastAPI(title="Free LLM API Router", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize global persistent connection pool with Keep-Alive
+    limits = httpx.Limits(max_keepalive_connections=15, max_connections=40, keepalive_expiry=60.0)
+    router.http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(router.timeout, connect=10.0, read=120.0),
+        limits=limits,
+    )
+    gc.collect(1)
+    yield
+    # Clean shutdown of connection pool
+    if router.http_client:
+        await router.http_client.aclose()
+
+
+app = FastAPI(title="Free LLM API Router", version="1.0.0", lifespan=lifespan)
 
 
 @dataclass
@@ -41,6 +59,7 @@ class Router:
         self.max_retries = 3
         self.timeout = 30
         self.api_key = None
+        self.http_client: Optional[httpx.AsyncClient] = None
         self.current_idx = 0
         self.load_config(config_path)
 
@@ -207,7 +226,7 @@ async def chat_completions(request: Request):
         }
 
         start = time.time()
-        client = httpx.AsyncClient(timeout=httpx.Timeout(router.timeout, connect=10.0, read=120.0))
+        client = router.http_client or httpx.AsyncClient(timeout=httpx.Timeout(router.timeout, connect=10.0, read=120.0))
         try:
             if stream:
                 req = client.build_request(
@@ -220,7 +239,6 @@ async def chat_completions(request: Request):
 
                 if resp.status_code == 429:
                     await resp.aclose()
-                    await client.aclose()
                     print(f"⚠️ Provider '{provider.name}' rate limited (429). Failing over...")
                     router.mark_rate_limited(provider)
                     if router.failover:
@@ -230,7 +248,6 @@ async def chat_completions(request: Request):
                 if resp.status_code != 200:
                     err_bytes = await resp.aread()
                     await resp.aclose()
-                    await client.aclose()
                     print(f"❌ Provider '{provider.name}' error ({resp.status_code}): {err_bytes.decode('utf-8', errors='ignore')[:150]}")
                     router.record_error(provider)
                     if router.failover:
@@ -249,39 +266,34 @@ async def chat_completions(request: Request):
                             yield chunk
                     finally:
                         await resp.aclose()
-                        await client.aclose()
 
                 return StreamingResponse(stream_gen(), media_type="text/event-stream")
             else:
-                try:
-                    resp = await client.post(
-                        f"{provider.base_url}/chat/completions",
-                        json=request_body,
-                        headers=headers,
-                    )
-                    latency = time.time() - start
+                resp = await client.post(
+                    f"{provider.base_url}/chat/completions",
+                    json=request_body,
+                    headers=headers,
+                )
+                latency = time.time() - start
 
-                    if resp.status_code == 429:
-                        router.mark_rate_limited(provider)
-                        if router.failover:
-                            continue
-                        return JSONResponse(status_code=429, content={"error": {"message": "Rate limited"}})
+                if resp.status_code == 429:
+                    router.mark_rate_limited(provider)
+                    if router.failover:
+                        continue
+                    return JSONResponse(status_code=429, content={"error": {"message": "Rate limited"}})
 
-                    if resp.status_code != 200:
-                        router.record_error(provider)
-                        if router.failover:
-                            continue
-                        return JSONResponse(status_code=resp.status_code, content=resp.json())
+                if resp.status_code != 200:
+                    router.record_error(provider)
+                    if router.failover:
+                        continue
+                    return JSONResponse(status_code=resp.status_code, content=resp.json())
 
-                    router.record_success(provider, latency)
-                    result = resp.json()
-                    result["_router"] = {"provider": provider.name, "latency_ms": int(latency * 1000)}
-                    return JSONResponse(content=result)
-                finally:
-                    await client.aclose()
+                router.record_success(provider, latency)
+                result = resp.json()
+                result["_router"] = {"provider": provider.name, "latency_ms": int(latency * 1000)}
+                return JSONResponse(content=result)
 
         except Exception as e:
-            await client.aclose()
             router.record_error(provider)
             if router.failover and attempt < router.max_retries - 1:
                 continue
@@ -336,4 +348,12 @@ if __name__ == "__main__":
         print(f"🔒 Authentication: ENABLED (Key: {masked})")
     else:
         print("⚠️ Authentication: DISABLED (Public access)")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        limit_concurrency=40,
+        timeout_keep_alive=30,
+        access_log=False,
+    )
