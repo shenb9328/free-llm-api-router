@@ -74,22 +74,29 @@ class Router:
         self.max_retries = routing.get("max_retries", 3)
         self.timeout = routing.get("timeout", 30)
 
-    def get_provider(self, model: str = "auto") -> Optional[ProviderState]:
+    def get_provider(self, model: str = "auto", exclude: set = None) -> Optional[ProviderState]:
         now = time.time()
+        exclude = exclude or set()
+        candidates = [p for p in self.providers if p.rate_limited_until < now and p.name not in exclude]
+        if not candidates:
+            return None
+
+        is_auto = (
+            model == "auto"
+            or model.endswith(":auto")
+            or model == "default"
+            or "auto" in model.lower()
+        )
+
         available = [
-            p for p in self.providers
-            if p.rate_limited_until < now
-            and (
-                model == "auto"
-                or model in p.models
-                or model.startswith(f"{p.name}/")
-                or any(model.startswith(m.split("/")[0]) for m in p.models)
-            )
+            p for p in candidates
+            if is_auto
+            or model in p.models
+            or model.startswith(f"{p.name}/")
+            or any(model.startswith(m.split("/")[0]) for m in p.models)
         ]
         if not available:
-            available = [p for p in self.providers if p.rate_limited_until < now]
-        if not available:
-            return None
+            available = candidates
 
         if self.strategy == "round-robin":
             provider = available[self.current_idx % len(available)]
@@ -159,20 +166,39 @@ async def chat_completions(request: Request):
     body = await request.json()
     model = body.get("model", "auto")
     stream = body.get("stream", False)
+    print(f"📥 Received request: raw_model='{model}', stream={stream}")
 
+    tried_providers = set()
     for attempt in range(router.max_retries):
-        provider = router.get_provider(model)
+        provider = router.get_provider(model, exclude=tried_providers)
         if not provider:
+            print("⚠️ No more available providers to try.")
             return JSONResponse(
                 status_code=503,
-                content={"error": {"message": "All providers unavailable", "type": "server_error"}},
+                content={"error": {"message": "All providers unavailable or retries exhausted", "type": "server_error"}},
             )
+        tried_providers.add(provider.name)
 
-        actual_model = model
-        if model == "auto":
+        # Map requested model to actual provider model name
+        is_auto = (
+            model == "auto"
+            or model.endswith(":auto")
+            or model == "default"
+            or "auto" in model.lower()
+        )
+
+        if is_auto:
             actual_model = provider.models[0] if provider.models else "default"
         elif model.startswith(f"{provider.name}/"):
             actual_model = model[len(provider.name) + 1:]
+        elif model in provider.models:
+            actual_model = model
+        elif any(model.endswith(f"/{m}") for m in provider.models):
+            actual_model = next(m for m in provider.models if model.endswith(f"/{m}"))
+        else:
+            actual_model = provider.models[0] if provider.models else "default"
+
+        print(f"🔄 [Attempt {attempt+1}/{router.max_retries}] Routing to '{provider.name}' with actual_model='{actual_model}'")
 
         request_body = {**body, "model": actual_model}
         headers = {
@@ -195,6 +221,7 @@ async def chat_completions(request: Request):
                 if resp.status_code == 429:
                     await resp.aclose()
                     await client.aclose()
+                    print(f"⚠️ Provider '{provider.name}' rate limited (429). Failing over...")
                     router.mark_rate_limited(provider)
                     if router.failover:
                         continue
@@ -204,6 +231,7 @@ async def chat_completions(request: Request):
                     err_bytes = await resp.aread()
                     await resp.aclose()
                     await client.aclose()
+                    print(f"❌ Provider '{provider.name}' error ({resp.status_code}): {err_bytes.decode('utf-8', errors='ignore')[:150]}")
                     router.record_error(provider)
                     if router.failover:
                         continue
