@@ -9,14 +9,111 @@ import time
 import json
 import os
 import gc
+import datetime
 import yaml
 import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
+
+
+class UsageLogger:
+    def __init__(self, logs_dir="logs", retention_days=3):
+        self.logs_dir = Path(logs_dir)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.retention_days = retention_days
+        self.cleanup_old_logs()
+
+    def get_today_log_path(self) -> Path:
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        return self.logs_dir / f"{date_str}.log"
+
+    def cleanup_old_logs(self):
+        """Keep only the newest `retention_days` daily log files. Files older than 3 days are deleted."""
+        try:
+            log_files = sorted(self.logs_dir.glob("*.log"), reverse=True)
+            if len(log_files) > self.retention_days:
+                for old_file in log_files[self.retention_days:]:
+                    old_file.unlink(missing_ok=True)
+                    print(f"🗑️ Deleted expired log file (> {self.retention_days} days): {old_file.name}")
+        except Exception as e:
+            print(f"⚠️ Error cleaning old logs: {e}")
+
+    def log(
+        self,
+        client_ip: str,
+        requested_model: str,
+        provider: str,
+        actual_model: str,
+        stream: bool,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        latency_ms: int = 0,
+        status_code: int = 200,
+        error: Optional[str] = None,
+    ):
+        self.cleanup_old_logs()
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_line = (
+            f"[{now_str}] IP={client_ip} | ReqModel={requested_model} | "
+            f"Provider={provider} | Model={actual_model} | Stream={stream} | "
+            f"Tokens: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens} | "
+            f"Latency={latency_ms}ms | Status={status_code}"
+        )
+        if error:
+            log_line += f" | Error={error}"
+
+        log_path = self.get_today_log_path()
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(log_line + "\n")
+        except Exception as e:
+            print(f"⚠️ Failed to write usage log: {e}")
+
+    def get_summary(self) -> Dict[str, Any]:
+        self.cleanup_old_logs()
+        today_file = self.get_today_log_path()
+        files = [
+            {"name": f.name, "size_bytes": f.stat().st_size}
+            for f in sorted(self.logs_dir.glob("*.log"), reverse=True)
+        ]
+        model_stats: Dict[str, Dict[str, int]] = {}
+        total_requests = 0
+
+        if today_file.exists():
+            with open(today_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    total_requests += 1
+                    try:
+                        parts = [p.strip() for p in line.split("|")]
+                        model_part = next((p for p in parts if p.startswith("Model=")), "")
+                        model_name = model_part.split("=", 1)[1] if model_part else "other"
+
+                        tok_part = next((p for p in parts if p.startswith("Tokens:")), "")
+                        total_tok = 0
+                        if "total=" in tok_part:
+                            total_tok = int(tok_part.split("total=")[1].split()[0].replace(",", ""))
+
+                        if model_name not in model_stats:
+                            model_stats[model_name] = {"requests": 0, "total_tokens": 0}
+                        model_stats[model_name]["requests"] += 1
+                        model_stats[model_name]["total_tokens"] += total_tok
+                    except Exception:
+                        continue
+
+        return {
+            "today": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "total_requests_today": total_requests,
+            "models_usage_today": model_stats,
+            "retained_log_files": files,
+        }
+
+
+usage_logger = UsageLogger()
 
 
 @asynccontextmanager
@@ -27,6 +124,7 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(router.timeout, connect=10.0, read=120.0),
         limits=limits,
     )
+    usage_logger.cleanup_old_logs()
     gc.collect(1)
     yield
     # Clean shutdown of connection pool
@@ -185,13 +283,28 @@ async def chat_completions(request: Request):
     body = await request.json()
     model = body.get("model", "auto")
     stream = body.get("stream", False)
-    print(f"📥 Received request: raw_model='{model}', stream={stream}")
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    start_total = time.time()
+    print(f"📥 Received request: IP={client_ip}, raw_model='{model}', stream={stream}")
 
     tried_providers = set()
     for attempt in range(router.max_retries):
         provider = router.get_provider(model, exclude=tried_providers)
         if not provider:
             print("⚠️ No more available providers to try.")
+            usage_logger.log(
+                client_ip=client_ip,
+                requested_model=model,
+                provider="none",
+                actual_model="none",
+                stream=stream,
+                latency_ms=int((time.time() - start_total) * 1000),
+                status_code=503,
+                error="All providers unavailable or retries exhausted",
+            )
             return JSONResponse(
                 status_code=503,
                 content={"error": {"message": "All providers unavailable or retries exhausted", "type": "server_error"}},
@@ -241,6 +354,16 @@ async def chat_completions(request: Request):
                     await resp.aclose()
                     print(f"⚠️ Provider '{provider.name}' rate limited (429). Failing over...")
                     router.mark_rate_limited(provider)
+                    usage_logger.log(
+                        client_ip=client_ip,
+                        requested_model=model,
+                        provider=provider.name,
+                        actual_model=actual_model,
+                        stream=True,
+                        latency_ms=int((time.time() - start) * 1000),
+                        status_code=429,
+                        error="Rate limited",
+                    )
                     if router.failover:
                         continue
                     return JSONResponse(status_code=429, content={"error": {"message": "Rate limited"}})
@@ -248,24 +371,64 @@ async def chat_completions(request: Request):
                 if resp.status_code != 200:
                     err_bytes = await resp.aread()
                     await resp.aclose()
-                    print(f"❌ Provider '{provider.name}' error ({resp.status_code}): {err_bytes.decode('utf-8', errors='ignore')[:150]}")
+                    err_msg = err_bytes.decode("utf-8", errors="ignore")[:150]
+                    print(f"❌ Provider '{provider.name}' error ({resp.status_code}): {err_msg}")
                     router.record_error(provider)
+                    usage_logger.log(
+                        client_ip=client_ip,
+                        requested_model=model,
+                        provider=provider.name,
+                        actual_model=actual_model,
+                        stream=True,
+                        latency_ms=int((time.time() - start) * 1000),
+                        status_code=resp.status_code,
+                        error=err_msg,
+                    )
                     if router.failover:
                         continue
                     return JSONResponse(
                         status_code=resp.status_code,
-                        content={"error": {"message": f"Provider error: {resp.status_code} - {err_bytes.decode('utf-8', errors='ignore')}"}},
+                        content={"error": {"message": f"Provider error: {resp.status_code} - {err_msg}"}},
                     )
 
                 latency = time.time() - start
                 router.record_success(provider, latency)
 
                 async def stream_gen():
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    total_tokens = 0
                     try:
                         async for chunk in resp.aiter_bytes():
+                            if b'"usage"' in chunk:
+                                try:
+                                    for line in chunk.split(b"\n"):
+                                        line = line.strip()
+                                        if line.startswith(b"data: ") and line != b"data: [DONE]":
+                                            payload = json.loads(line[6:])
+                                            u = payload.get("usage")
+                                            if u:
+                                                prompt_tokens = u.get("prompt_tokens", prompt_tokens)
+                                                completion_tokens = u.get("completion_tokens", completion_tokens)
+                                                total_tokens = u.get("total_tokens", prompt_tokens + completion_tokens)
+                                except Exception:
+                                    pass
                             yield chunk
                     finally:
                         await resp.aclose()
+                        latency_ms = int((time.time() - start) * 1000)
+                        usage_logger.log(
+                            client_ip=client_ip,
+                            requested_model=model,
+                            provider=provider.name,
+                            actual_model=actual_model,
+                            stream=True,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            total_tokens=total_tokens,
+                            latency_ms=latency_ms,
+                            status_code=200,
+                        )
 
                 return StreamingResponse(stream_gen(), media_type="text/event-stream")
             else:
@@ -278,12 +441,33 @@ async def chat_completions(request: Request):
 
                 if resp.status_code == 429:
                     router.mark_rate_limited(provider)
+                    usage_logger.log(
+                        client_ip=client_ip,
+                        requested_model=model,
+                        provider=provider.name,
+                        actual_model=actual_model,
+                        stream=False,
+                        latency_ms=int((time.time() - start) * 1000),
+                        status_code=429,
+                        error="Rate limited",
+                    )
                     if router.failover:
                         continue
                     return JSONResponse(status_code=429, content={"error": {"message": "Rate limited"}})
 
                 if resp.status_code != 200:
                     router.record_error(provider)
+                    err_msg = resp.text[:150]
+                    usage_logger.log(
+                        client_ip=client_ip,
+                        requested_model=model,
+                        provider=provider.name,
+                        actual_model=actual_model,
+                        stream=False,
+                        latency_ms=int((time.time() - start) * 1000),
+                        status_code=resp.status_code,
+                        error=err_msg,
+                    )
                     if router.failover:
                         continue
                     return JSONResponse(status_code=resp.status_code, content=resp.json())
@@ -291,15 +475,58 @@ async def chat_completions(request: Request):
                 router.record_success(provider, latency)
                 result = resp.json()
                 result["_router"] = {"provider": provider.name, "latency_ms": int(latency * 1000)}
+
+                u = result.get("usage", {}) or {}
+                p_tok = u.get("prompt_tokens", 0)
+                c_tok = u.get("completion_tokens", 0)
+                t_tok = u.get("total_tokens", p_tok + c_tok)
+                usage_logger.log(
+                    client_ip=client_ip,
+                    requested_model=model,
+                    provider=provider.name,
+                    actual_model=actual_model,
+                    stream=False,
+                    prompt_tokens=p_tok,
+                    completion_tokens=c_tok,
+                    total_tokens=t_tok,
+                    latency_ms=int(latency * 1000),
+                    status_code=200,
+                )
                 return JSONResponse(content=result)
 
         except Exception as e:
             router.record_error(provider)
             if router.failover and attempt < router.max_retries - 1:
                 continue
+            usage_logger.log(
+                client_ip=client_ip,
+                requested_model=model,
+                provider=provider.name,
+                actual_model=actual_model,
+                stream=stream,
+                latency_ms=int((time.time() - start) * 1000),
+                status_code=502,
+                error=str(e),
+            )
             return JSONResponse(status_code=502, content={"error": {"message": str(e)}})
 
+    usage_logger.log(
+        client_ip=client_ip,
+        requested_model=model,
+        provider="none",
+        actual_model="none",
+        stream=stream,
+        latency_ms=int((time.time() - start_total) * 1000),
+        status_code=503,
+        error="All retries exhausted",
+    )
     return JSONResponse(status_code=503, content={"error": {"message": "All retries exhausted"}})
+
+
+@app.get("/usage")
+@app.get("/v1/usage")
+async def get_usage():
+    return usage_logger.get_summary()
 
 
 @app.get("/v1/models")
