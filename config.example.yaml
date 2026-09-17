@@ -2,44 +2,55 @@
 # Copy to config.yaml and add your free API keys
 
 # Optional: Require Bearer token authentication to protect your endpoint
-# api_key: "sk-your-secret-key"
+api_key: "sk-your-secret-key"
 
 providers:
-  - name: groq
-    base_url: https://api.groq.com/openai/v1
-    api_key: YOUR_GROQ_KEY  # Free at console.groq.com
-    models: [openai/gpt-oss-120b, qwen/qwen3.8-27b, openai/gpt-oss-20b]
-    priority: 1
-
   - name: google
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
     api_key: YOUR_GOOGLE_KEY  # Free at aistudio.google.com
-    models: [gemini-3.5-flash]
+    models: [gemini-flash-latest, gemini-3.5-flash-lite, gemini-3.1-flash-lite]
+    priority: 1
+    supports_vision: true
+    max_context: 1000000
+
+  - name: nous
+    base_url: https://inference-api.nousresearch.com/v1
+    api_key: YOUR_NOUS_KEY  # Free models at portal.nousresearch.com
+    models: [meituan/longcat-2.0:free]
     priority: 2
+    supports_vision: false
+    max_context: 128000
 
   - name: openrouter
     base_url: https://openrouter.ai/api/v1
     api_key: YOUR_OPENROUTER_KEY  # Free models at openrouter.ai
     models:
+      - "nvidia/nemotron-3.5-lightning:free"
+      - "inclusionai/ling-3.0-flash-vl:free"
+      - "cohere/north-mini-code:free"
       - "nvidia/nemotron-3-super-120b-a12b:free"
-      - "z-ai/glm-5.2:free"
-      - "google/gemma-4-31b-it:free"
     priority: 3
+    supports_vision: true
+    max_context: 128000
+
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key: YOUR_GROQ_KEY  # Free at console.groq.com
+    models: [openai/gpt-oss-120b, qwen/qwen3.8-27b, openai/gpt-oss-20b]
+    priority: 4
+    supports_vision: false
+    max_context: 4000
 
   - name: mistral
     base_url: https://api.mistral.ai/v1
     api_key: YOUR_MISTRAL_KEY  # Free at console.mistral.ai
     models: [codestral-latest, ministral-8b-latest, ministral-3b-latest]
-    priority: 4
-
-  - name: nous
-    base_url: https://inference-api.nousresearch.com/v1
-    api_key: YOUR_NOUS_KEY  # Free models at portal.nousresearch.com
-    models: [meituan/longcat-2.0:free, inclusionai/ling-3.0-flash-sante:free]
     priority: 5
+    supports_vision: false
+    max_context: 32000
 
 routing:
-  strategy: priority  # round-robin | priority | random | least-latency
+  strategy: smart-priority  # smart-priority | round-robin | priority | least-latency
   failover: true
   max_retries: 5
-  timeout: 30
+  timeout: 45

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Free LLM API Router - Route requests across multiple free LLM providers.
-OpenAI-compatible /v1/chat/completions endpoint with automatic failover.
+OpenAI-compatible /v1/chat/completions endpoint with automatic failover,
+smart capability-based routing (vision, large context, tool calling),
+content normalization, and resilient stream delivery.
 """
 
 import asyncio
@@ -12,11 +14,12 @@ import gc
 import datetime
 import yaml
 import httpx
+import httpcore
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 
 
@@ -65,7 +68,8 @@ class UsageLogger:
             f"Latency={latency_ms}ms | Status={status_code}"
         )
         if error:
-            log_line += f" | Error={error}"
+            clean_error = error.replace("\r", " ").replace("\n", " ").strip()
+            log_line += f" | Error={clean_error}"
 
         log_path = self.get_today_log_path()
         try:
@@ -87,6 +91,9 @@ class UsageLogger:
         if today_file.exists():
             with open(today_file, "r", encoding="utf-8") as f:
                 for line in f:
+                    line = line.strip()
+                    if not line or not line.startswith("["):
+                        continue
                     total_requests += 1
                     try:
                         parts = [p.strip() for p in line.split("|")]
@@ -116,25 +123,6 @@ class UsageLogger:
 usage_logger = UsageLogger()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize global persistent connection pool with Keep-Alive
-    limits = httpx.Limits(max_keepalive_connections=15, max_connections=40, keepalive_expiry=60.0)
-    router.http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(router.timeout, connect=10.0, read=120.0),
-        limits=limits,
-    )
-    usage_logger.cleanup_old_logs()
-    gc.collect(1)
-    yield
-    # Clean shutdown of connection pool
-    if router.http_client:
-        await router.http_client.aclose()
-
-
-app = FastAPI(title="Free LLM API Router", version="1.0.0", lifespan=lifespan)
-
-
 @dataclass
 class ProviderState:
     name: str
@@ -142,6 +130,8 @@ class ProviderState:
     api_key: str
     models: list
     priority: int = 1
+    supports_vision: bool = False
+    max_context: int = 128000
     requests_made: int = 0
     last_used: float = 0
     rate_limited_until: float = 0
@@ -152,10 +142,10 @@ class ProviderState:
 class Router:
     def __init__(self, config_path="config.yaml"):
         self.providers: list[ProviderState] = []
-        self.strategy = "round-robin"
+        self.strategy = "smart-priority"
         self.failover = True
-        self.max_retries = 3
-        self.timeout = 30
+        self.max_retries = 5
+        self.timeout = 45
         self.api_key = None
         self.http_client: Optional[httpx.AsyncClient] = None
         self.current_idx = 0
@@ -183,18 +173,47 @@ class Router:
                 api_key=key,
                 models=p.get("models", []),
                 priority=p.get("priority", 99),
+                supports_vision=bool(p.get("supports_vision", False)),
+                max_context=int(p.get("max_context", 128000)),
             ))
 
         routing = cfg.get("routing", {})
-        self.strategy = routing.get("strategy", "round-robin")
+        self.strategy = routing.get("strategy", "smart-priority")
         self.failover = routing.get("failover", True)
-        self.max_retries = routing.get("max_retries", 3)
-        self.timeout = routing.get("timeout", 30)
+        self.max_retries = routing.get("max_retries", 5)
+        self.timeout = routing.get("timeout", 45)
 
-    def get_provider(self, model: str = "auto", exclude: set = None) -> Optional[ProviderState]:
+    def get_provider(
+        self,
+        model: str = "auto",
+        exclude: set = None,
+        has_images: bool = False,
+        estimated_tokens: int = 0,
+    ) -> Optional[ProviderState]:
         now = time.time()
         exclude = exclude or set()
-        candidates = [p for p in self.providers if p.rate_limited_until < now and p.name not in exclude]
+
+        candidates = [
+            p for p in self.providers
+            if p.rate_limited_until < now and p.name not in exclude
+        ]
+        if not candidates:
+            return None
+
+        # 1. Vision constraint: If request contains images, restrict to vision-capable providers
+        if has_images:
+            vision_candidates = [p for p in candidates if p.supports_vision]
+            if vision_candidates:
+                candidates = vision_candidates
+            else:
+                candidates = [p for p in candidates if p.name in ["google", "openrouter"]]
+
+        # 2. Context constraint: If prompt is large (>4000 tokens), avoid low-context providers (e.g. Groq free tier)
+        if estimated_tokens > 4000:
+            large_ctx_candidates = [p for p in candidates if p.max_context >= estimated_tokens]
+            if large_ctx_candidates:
+                candidates = large_ctx_candidates
+
         if not candidates:
             return None
 
@@ -218,13 +237,12 @@ class Router:
         if self.strategy == "round-robin":
             provider = available[self.current_idx % len(available)]
             self.current_idx += 1
-        elif self.strategy == "priority":
+        elif self.strategy in ["priority", "smart-priority"]:
             provider = min(available, key=lambda p: p.priority)
         elif self.strategy == "least-latency":
             provider = min(available, key=lambda p: p.avg_latency if p.avg_latency > 0 else float("inf"))
         else:
-            provider = available[self.current_idx % len(available)]
-            self.current_idx += 1
+            provider = min(available, key=lambda p: p.priority)
 
         return provider
 
@@ -248,13 +266,85 @@ class Router:
 router = Router()
 
 
+def inspect_and_normalize_request(body: dict) -> Tuple[dict, dict]:
+    """
+    Normalizes request body and extracts key characteristics:
+    - has_images: True if any message contains image_url
+    - has_tools: True if request has tools or tool_calls
+    - estimated_tokens: estimated prompt token count
+    - normalized_body: cleaned body where text-only list content is flattened to string
+    """
+    messages = body.get("messages", [])
+    has_images = False
+    has_tools = bool(body.get("tools") or body.get("functions"))
+    char_count = 0
+
+    new_messages = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        tool_calls = msg.get("tool_calls")
+        if tool_calls or role == "tool":
+            has_tools = True
+
+        if isinstance(content, list):
+            # Check for multimodal image parts
+            msg_has_image = any(
+                isinstance(part, dict) and (part.get("type") == "image_url" or "image_url" in part)
+                for part in content
+            )
+            if msg_has_image:
+                has_images = True
+                new_messages.append(msg)
+                char_count += len(str(content))
+            else:
+                # Text-only list parts: flatten into a single string (fixes Groq 400 & Mistral 422)
+                text_parts = [
+                    part.get("text", "") for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                flattened_text = "".join(text_parts) if text_parts else str(content)
+                new_msg = {**msg, "content": flattened_text}
+                new_messages.append(new_msg)
+                char_count += len(flattened_text)
+        else:
+            new_messages.append(msg)
+            if isinstance(content, str):
+                char_count += len(content)
+
+    estimated_tokens = char_count // 3
+
+    normalized_body = {**body, "messages": new_messages}
+    meta = {
+        "has_images": has_images,
+        "has_tools": has_tools,
+        "estimated_tokens": estimated_tokens,
+    }
+    return normalized_body, meta
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0)
+    router.http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(router.timeout, connect=10.0, read=120.0),
+        limits=limits,
+    )
+    usage_logger.cleanup_old_logs()
+    gc.collect(1)
+    yield
+    if router.http_client:
+        await router.http_client.aclose()
+
+
+app = FastAPI(title="Free LLM API Router", version="1.1.0", lifespan=lifespan)
+
+
 @app.middleware("http")
 async def authenticate_request(request: Request, call_next):
-    # Public endpoints
     if request.url.path in ["/health", "/docs", "/openapi.json"]:
         return await call_next(request)
 
-    # If router has an api_key configured, enforce Bearer token verification
     if router.api_key:
         auth_header = request.headers.get("Authorization", "")
         token = ""
@@ -280,21 +370,36 @@ async def authenticate_request(request: Request, call_next):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body = await request.json()
-    model = body.get("model", "auto")
-    stream = body.get("stream", False)
+    raw_body = await request.json()
+    model = raw_body.get("model", "auto")
+    stream = raw_body.get("stream", False)
     client_ip = (
         request.headers.get("x-forwarded-for", "").split(",")[0].strip()
         or (request.client.host if request.client else "unknown")
     )
     start_total = time.time()
-    print(f"📥 Received request: IP={client_ip}, raw_model='{model}', stream={stream}")
+
+    # Pre-inspect and normalize messages (flatten text arrays, check images, estimate tokens)
+    normalized_body, meta = inspect_and_normalize_request(raw_body)
+    has_images = meta["has_images"]
+    estimated_tokens = meta["estimated_tokens"]
+
+    print(
+        f"📥 Request: IP={client_ip}, model='{model}', stream={stream}, "
+        f"tokens~{estimated_tokens}, vision={has_images}, tools={meta['has_tools']}"
+    )
 
     tried_providers = set()
+
     for attempt in range(router.max_retries):
-        provider = router.get_provider(model, exclude=tried_providers)
+        provider = router.get_provider(
+            model=model,
+            exclude=tried_providers,
+            has_images=has_images,
+            estimated_tokens=estimated_tokens,
+        )
         if not provider:
-            print("⚠️ No more available providers to try.")
+            print("⚠️ No suitable provider available for this request.")
             usage_logger.log(
                 client_ip=client_ip,
                 requested_model=model,
@@ -303,12 +408,13 @@ async def chat_completions(request: Request):
                 stream=stream,
                 latency_ms=int((time.time() - start_total) * 1000),
                 status_code=503,
-                error="All providers unavailable or retries exhausted",
+                error="No suitable provider available (constraints not met)",
             )
             return JSONResponse(
                 status_code=503,
-                content={"error": {"message": "All providers unavailable or retries exhausted", "type": "server_error"}},
+                content={"error": {"message": "No suitable provider available or retries exhausted", "type": "server_error"}},
             )
+
         tried_providers.add(provider.name)
 
         # Map requested model to actual provider model name
@@ -320,7 +426,12 @@ async def chat_completions(request: Request):
         )
 
         if is_auto:
-            actual_model = provider.models[0] if provider.models else "default"
+            if has_images and provider.name == "openrouter":
+                actual_model = "inclusionai/ling-3.0-flash-vl:free"
+            elif has_images and provider.name == "google":
+                actual_model = "gemini-flash-latest"
+            else:
+                actual_model = provider.models[0] if provider.models else "default"
         elif model.startswith(f"{provider.name}/"):
             actual_model = model[len(provider.name) + 1:]
         elif model in provider.models:
@@ -332,7 +443,7 @@ async def chat_completions(request: Request):
 
         print(f"🔄 [Attempt {attempt+1}/{router.max_retries}] Routing to '{provider.name}' with actual_model='{actual_model}'")
 
-        request_body = {**body, "model": actual_model}
+        request_body = {**normalized_body, "model": actual_model}
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {provider.api_key}",
@@ -340,6 +451,7 @@ async def chat_completions(request: Request):
 
         start = time.time()
         client = router.http_client or httpx.AsyncClient(timeout=httpx.Timeout(router.timeout, connect=10.0, read=120.0))
+
         try:
             if stream:
                 req = client.build_request(
@@ -391,6 +503,40 @@ async def chat_completions(request: Request):
                         content={"error": {"message": f"Provider error: {resp.status_code} - {err_msg}"}},
                     )
 
+                # Peek first chunk to catch immediate errors disguised as HTTP 200 (e.g. OpenRouter upstream errors)
+                chunk_iter = resp.aiter_bytes()
+                first_chunk = None
+                try:
+                    first_chunk = await chunk_iter.__anext__()
+                except StopAsyncIteration:
+                    first_chunk = b""
+                except Exception as e:
+                    await resp.aclose()
+                    router.record_error(provider)
+                    print(f"❌ Provider '{provider.name}' failed to yield initial chunk: {e}")
+                    if router.failover:
+                        continue
+                    return JSONResponse(status_code=502, content={"error": {"message": f"Stream error: {e}"}})
+
+                if b'"error"' in first_chunk and (b'"message"' in first_chunk or b'"code"' in first_chunk):
+                    err_msg = first_chunk.decode("utf-8", errors="ignore")[:150]
+                    await resp.aclose()
+                    print(f"❌ Provider '{provider.name}' returned error chunk: {err_msg}")
+                    router.record_error(provider)
+                    usage_logger.log(
+                        client_ip=client_ip,
+                        requested_model=model,
+                        provider=provider.name,
+                        actual_model=actual_model,
+                        stream=True,
+                        latency_ms=int((time.time() - start) * 1000),
+                        status_code=502,
+                        error=f"Stream error chunk: {err_msg}",
+                    )
+                    if router.failover:
+                        continue
+                    return JSONResponse(status_code=502, content={"error": {"message": err_msg}})
+
                 latency = time.time() - start
                 router.record_success(provider, latency)
 
@@ -398,8 +544,10 @@ async def chat_completions(request: Request):
                     prompt_tokens = 0
                     completion_tokens = 0
                     total_tokens = 0
+                    if first_chunk:
+                        yield first_chunk
                     try:
-                        async for chunk in resp.aiter_bytes():
+                        async for chunk in chunk_iter:
                             if b'"usage"' in chunk:
                                 try:
                                     for line in chunk.split(b"\n"):
@@ -414,6 +562,9 @@ async def chat_completions(request: Request):
                                 except Exception:
                                     pass
                             yield chunk
+                    except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpcore.RemoteProtocolError, asyncio.TimeoutError) as e:
+                        print(f"⚠️ Upstream stream severed by '{provider.name}': {e}. Gracefully closing SSE.")
+                        yield b"\ndata: [DONE]\n\n"
                     finally:
                         await resp.aclose()
                         latency_ms = int((time.time() - start) * 1000)
@@ -431,6 +582,7 @@ async def chat_completions(request: Request):
                         )
 
                 return StreamingResponse(stream_gen(), media_type="text/event-stream")
+
             else:
                 resp = await client.post(
                     f"{provider.base_url}/chat/completions",
@@ -472,8 +624,29 @@ async def chat_completions(request: Request):
                         continue
                     return JSONResponse(status_code=resp.status_code, content=resp.json())
 
-                router.record_success(provider, latency)
                 result = resp.json()
+
+                # Catch pseudo-200 responses with error payload
+                if isinstance(result, dict) and "error" in result and result.get("error"):
+                    err_obj = result["error"]
+                    err_msg = err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
+                    print(f"❌ Provider '{provider.name}' returned 200 with error body: {err_msg}")
+                    router.record_error(provider)
+                    usage_logger.log(
+                        client_ip=client_ip,
+                        requested_model=model,
+                        provider=provider.name,
+                        actual_model=actual_model,
+                        stream=False,
+                        latency_ms=int(latency * 1000),
+                        status_code=502,
+                        error=f"Upstream error in 200: {err_msg}",
+                    )
+                    if router.failover:
+                        continue
+                    return JSONResponse(status_code=502, content={"error": {"message": err_msg}})
+
+                router.record_success(provider, latency)
                 result["_router"] = {"provider": provider.name, "latency_ms": int(latency * 1000)}
 
                 u = result.get("usage", {}) or {}
@@ -546,6 +719,9 @@ async def status():
             {
                 "name": p.name,
                 "available": p.rate_limited_until < time.time(),
+                "priority": p.priority,
+                "supports_vision": p.supports_vision,
+                "max_context": p.max_context,
                 "requests": p.requests_made,
                 "avg_latency_ms": int(p.avg_latency * 1000),
                 "errors": p.errors,
