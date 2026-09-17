@@ -3,7 +3,7 @@
 Free LLM API Router - Route requests across multiple free LLM providers.
 OpenAI-compatible /v1/chat/completions endpoint with automatic failover,
 smart capability-based routing (vision, large context, tool calling),
-content normalization, and resilient stream delivery.
+content normalization, multi-key round-robin pooling, and resilient stream delivery.
 """
 
 import asyncio
@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class UsageLogger:
@@ -124,11 +124,19 @@ usage_logger = UsageLogger()
 
 
 @dataclass
+class KeyState:
+    key: str
+    rate_limited_until: float = 0
+    errors: int = 0
+    requests_made: int = 0
+
+
+@dataclass
 class ProviderState:
     name: str
     base_url: str
-    api_key: str
-    models: list
+    api_keys: List[KeyState] = field(default_factory=list)
+    models: list = field(default_factory=list)
     priority: int = 1
     supports_vision: bool = False
     max_context: int = 128000
@@ -137,6 +145,21 @@ class ProviderState:
     rate_limited_until: float = 0
     errors: int = 0
     avg_latency: float = 0
+    key_idx: int = 0
+
+    def get_active_key(self) -> Optional[KeyState]:
+        now = time.time()
+        available_keys = [k for k in self.api_keys if k.rate_limited_until < now]
+        if not available_keys:
+            return None
+        selected = available_keys[self.key_idx % len(available_keys)]
+        self.key_idx += 1
+        return selected
+
+    @property
+    def api_key(self) -> str:
+        k = self.get_active_key()
+        return k.key if k else (self.api_keys[0].key if self.api_keys else "")
 
 
 class Router:
@@ -164,13 +187,19 @@ class Router:
         self.api_key = cfg.get("api_key") or os.environ.get("ROUTER_API_KEY")
 
         for p in cfg.get("providers", []):
-            key = p.get("api_key", "")
-            if key.startswith("YOUR_"):
+            raw_keys = p.get("api_keys") or ([p["api_key"]] if "api_key" in p else [])
+            valid_keys = [
+                KeyState(key=str(k).strip())
+                for k in raw_keys
+                if k and not str(k).startswith("YOUR_")
+            ]
+            if not valid_keys:
                 continue  # Skip unconfigured providers
+
             self.providers.append(ProviderState(
                 name=p["name"],
                 base_url=p["base_url"],
-                api_key=key,
+                api_keys=valid_keys,
                 models=p.get("models", []),
                 priority=p.get("priority", 99),
                 supports_vision=bool(p.get("supports_vision", False)),
@@ -195,7 +224,9 @@ class Router:
 
         candidates = [
             p for p in self.providers
-            if p.rate_limited_until < now and p.name not in exclude
+            if p.rate_limited_until < now
+            and any(k.rate_limited_until < now for k in p.api_keys)
+            and p.name not in exclude
         ]
         if not candidates:
             return None
@@ -337,7 +368,7 @@ async def lifespan(app: FastAPI):
         await router.http_client.aclose()
 
 
-app = FastAPI(title="Free LLM API Router", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Free LLM API Router", version="1.2.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -379,7 +410,6 @@ async def chat_completions(request: Request):
     )
     start_total = time.time()
 
-    # Pre-inspect and normalize messages (flatten text arrays, check images, estimate tokens)
     normalized_body, meta = inspect_and_normalize_request(raw_body)
     has_images = meta["has_images"]
     estimated_tokens = meta["estimated_tokens"]
@@ -415,9 +445,14 @@ async def chat_completions(request: Request):
                 content={"error": {"message": "No suitable provider available or retries exhausted", "type": "server_error"}},
             )
 
+        active_key_state = provider.get_active_key()
+        if not active_key_state:
+            provider.rate_limited_until = time.time() + 30
+            tried_providers.add(provider.name)
+            continue
+
         tried_providers.add(provider.name)
 
-        # Map requested model to actual provider model name
         is_auto = (
             model == "auto"
             or model.endswith(":auto")
@@ -441,12 +476,13 @@ async def chat_completions(request: Request):
         else:
             actual_model = provider.models[0] if provider.models else "default"
 
-        print(f"🔄 [Attempt {attempt+1}/{router.max_retries}] Routing to '{provider.name}' with actual_model='{actual_model}'")
+        key_mask = active_key_state.key[:10] + "..." + active_key_state.key[-4:]
+        print(f"🔄 [Attempt {attempt+1}/{router.max_retries}] Routing to '{provider.name}' ({key_mask}) with actual_model='{actual_model}'")
 
         request_body = {**normalized_body, "model": actual_model}
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {provider.api_key}",
+            "Authorization": f"Bearer {active_key_state.key}",
         }
 
         start = time.time()
@@ -464,8 +500,13 @@ async def chat_completions(request: Request):
 
                 if resp.status_code == 429:
                     await resp.aclose()
-                    print(f"⚠️ Provider '{provider.name}' rate limited (429). Failing over...")
-                    router.mark_rate_limited(provider)
+                    active_key_state.rate_limited_until = time.time() + 60
+                    print(f"⚠️ Key {key_mask} on '{provider.name}' rate limited (429).")
+                    if not any(k.rate_limited_until < time.time() for k in provider.api_keys):
+                        router.mark_rate_limited(provider)
+                    else:
+                        tried_providers.discard(provider.name)  # Retry same provider with another key
+
                     usage_logger.log(
                         client_ip=client_ip,
                         requested_model=model,
@@ -486,6 +527,7 @@ async def chat_completions(request: Request):
                     err_msg = err_bytes.decode("utf-8", errors="ignore")[:150]
                     print(f"❌ Provider '{provider.name}' error ({resp.status_code}): {err_msg}")
                     router.record_error(provider)
+                    active_key_state.errors += 1
                     usage_logger.log(
                         client_ip=client_ip,
                         requested_model=model,
@@ -503,7 +545,6 @@ async def chat_completions(request: Request):
                         content={"error": {"message": f"Provider error: {resp.status_code} - {err_msg}"}},
                     )
 
-                # Peek first chunk to catch immediate errors disguised as HTTP 200 (e.g. OpenRouter upstream errors)
                 chunk_iter = resp.aiter_bytes()
                 first_chunk = None
                 try:
@@ -513,6 +554,7 @@ async def chat_completions(request: Request):
                 except Exception as e:
                     await resp.aclose()
                     router.record_error(provider)
+                    active_key_state.errors += 1
                     print(f"❌ Provider '{provider.name}' failed to yield initial chunk: {e}")
                     if router.failover:
                         continue
@@ -523,6 +565,7 @@ async def chat_completions(request: Request):
                     await resp.aclose()
                     print(f"❌ Provider '{provider.name}' returned error chunk: {err_msg}")
                     router.record_error(provider)
+                    active_key_state.errors += 1
                     usage_logger.log(
                         client_ip=client_ip,
                         requested_model=model,
@@ -539,6 +582,7 @@ async def chat_completions(request: Request):
 
                 latency = time.time() - start
                 router.record_success(provider, latency)
+                active_key_state.requests_made += 1
 
                 async def stream_gen():
                     prompt_tokens = 0
@@ -592,7 +636,13 @@ async def chat_completions(request: Request):
                 latency = time.time() - start
 
                 if resp.status_code == 429:
-                    router.mark_rate_limited(provider)
+                    active_key_state.rate_limited_until = time.time() + 60
+                    print(f"⚠️ Key {key_mask} on '{provider.name}' rate limited (429).")
+                    if not any(k.rate_limited_until < time.time() for k in provider.api_keys):
+                        router.mark_rate_limited(provider)
+                    else:
+                        tried_providers.discard(provider.name)
+
                     usage_logger.log(
                         client_ip=client_ip,
                         requested_model=model,
@@ -609,6 +659,7 @@ async def chat_completions(request: Request):
 
                 if resp.status_code != 200:
                     router.record_error(provider)
+                    active_key_state.errors += 1
                     err_msg = resp.text[:150]
                     usage_logger.log(
                         client_ip=client_ip,
@@ -626,12 +677,12 @@ async def chat_completions(request: Request):
 
                 result = resp.json()
 
-                # Catch pseudo-200 responses with error payload
                 if isinstance(result, dict) and "error" in result and result.get("error"):
                     err_obj = result["error"]
                     err_msg = err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
                     print(f"❌ Provider '{provider.name}' returned 200 with error body: {err_msg}")
                     router.record_error(provider)
+                    active_key_state.errors += 1
                     usage_logger.log(
                         client_ip=client_ip,
                         requested_model=model,
@@ -647,7 +698,12 @@ async def chat_completions(request: Request):
                     return JSONResponse(status_code=502, content={"error": {"message": err_msg}})
 
                 router.record_success(provider, latency)
-                result["_router"] = {"provider": provider.name, "latency_ms": int(latency * 1000)}
+                active_key_state.requests_made += 1
+                result["_router"] = {
+                    "provider": provider.name,
+                    "key": key_mask,
+                    "latency_ms": int(latency * 1000)
+                }
 
                 u = result.get("usage", {}) or {}
                 p_tok = u.get("prompt_tokens", 0)
@@ -669,6 +725,7 @@ async def chat_completions(request: Request):
 
         except Exception as e:
             router.record_error(provider)
+            active_key_state.errors += 1
             if router.failover and attempt < router.max_retries - 1:
                 continue
             usage_logger.log(
@@ -714,18 +771,21 @@ async def list_models():
 
 @app.get("/status")
 async def status():
+    now = time.time()
     return {
         "providers": [
             {
                 "name": p.name,
-                "available": p.rate_limited_until < time.time(),
+                "available": p.rate_limited_until < now and any(k.rate_limited_until < now for k in p.api_keys),
+                "total_keys": len(p.api_keys),
+                "active_keys": sum(1 for k in p.api_keys if k.rate_limited_until < now),
                 "priority": p.priority,
                 "supports_vision": p.supports_vision,
                 "max_context": p.max_context,
                 "requests": p.requests_made,
                 "avg_latency_ms": int(p.avg_latency * 1000),
                 "errors": p.errors,
-                "rate_limited_for": max(0, int(p.rate_limited_until - time.time())),
+                "rate_limited_for": max(0, int(p.rate_limited_until - now)),
             }
             for p in router.providers
         ],

@@ -7,8 +7,11 @@ api_key: "sk-your-secret-key"
 providers:
   - name: google
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key: YOUR_GOOGLE_KEY  # Free at aistudio.google.com
-    models: [gemini-flash-latest, gemini-3.5-flash-lite, gemini-3.1-flash-lite]
+    # Supports single api_key or multiple api_keys for load balancing
+    api_keys:
+      - YOUR_GOOGLE_KEY_1  # Free at aistudio.google.com
+      # - YOUR_GOOGLE_KEY_2
+    models: [gemini-3.5-flash-lite, gemini-flash-latest, gemini-3.1-flash-lite]
     priority: 1
     supports_vision: true
     max_context: 1000000
